@@ -33,7 +33,13 @@ is games over the board.
 
 ```
 generation 10 vs generation 0 (untrained)     +33  =24  -3     +191 Elo
+generation 21 vs generation 14                +30   =5  -5     +255 Elo
 ```
+
+The second match spans the draw-labelling fix described below. Note the draw counts: an
+earlier match between two similar checkpoints drew 46 of 60 games; this one drew 5 of 40.
+The engine started converting material advantages instead of shuffling them into the
+50-move rule — which is a stronger signal than the Elo number on its own.
 
 | | value |
 |---|---|
