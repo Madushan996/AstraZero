@@ -150,7 +150,50 @@ A positive Elo difference means the pipeline learns. Then chess:
 python train.py train --run runs/chess --game chess --profile balanced --minutes 180
 ```
 
-### In the cloud
+### Free: Kaggle or Colab
+
+Both work, and Kaggle is meaningfully better — not because of its GPU, but because it
+gives **4 CPU cores** against Colab's 2 on the free tier. Self-play is bound by
+single-threaded Python (see finding #1), so cores decide throughput:
+
+| | GPU | CPU cores | Session | Free quota | Games/hour |
+|---|---|---|---|---|---|
+| **Kaggle** | T4 ×2 / P100 | 4 | 9–12 h headless | 30 GPU-h/week | ~350 |
+| **Colab (free)** | T4 | 2 | disconnects on idle | variable | ~175 |
+
+That makes Kaggle roughly **10,500 games a week for free**. For reference, the 26,478
+games in this repo cost about $58 of paid compute — so around two and a half weeks of
+free Kaggle matches it.
+
+```python
+# Kaggle cell
+!git clone https://github.com/Madushan996/AstraZero.git
+%cd AstraZero
+!pip install -q python-chess
+
+from notebook_train import session
+session(hours=8.5)
+```
+
+Then **Save Version** — the output becomes a Dataset. Attach that dataset to your next
+session and it resumes automatically at the same generation with the full replay buffer.
+
+```python
+# Colab cell
+from google.colab import drive; drive.mount('/content/drive')
+!git clone https://github.com/Madushan996/AstraZero.git && cd AstraZero && pip install -q python-chess
+%cd AstraZero
+
+from notebook_train import session
+session(hours=3, store='/content/drive/MyDrive/astrazero')
+```
+
+[notebook_train.py](notebook_train.py) detects the environment, sets one self-play
+process per core, restores the previous run, trains, and saves back — trimming to the
+newest two checkpoints so the output stays small. Games are always kept in full: they are
+the irreplaceable part, and weights regenerate from them.
+
+### On paid cloud
 
 Self-play parallelises perfectly and is ~97% of the cost, so fan-out matters more than a
 fast GPU. Both [Modal](modal_app.py) and [Beam](beam_app.py) are supported:

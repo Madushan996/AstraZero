@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -41,7 +42,15 @@ def cmd_train(args: argparse.Namespace) -> int:
         if args.parallel:
             config.selfplay["parallel_games"] = args.parallel
 
+    if config is not None and args.processes:
+        config.selfplay_processes = args.processes
+
     session = TrainingSession(run_dir, config=config, device=args.device)
+    if args.processes:
+        session.config.selfplay_processes = args.processes
+    print(f"[self-play] {session.effective_processes()} process(es), "
+          f"{os.cpu_count()} CPU core(s) available")
+
     session.run_session(
         minutes=args.minutes,
         generations=args.generations,
@@ -218,6 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow --simulations/--parallel to change an existing run",
     )
     train.add_argument("--selfplay-fraction", type=float, default=0.8)
+    train.add_argument(
+        "--processes",
+        type=int,
+        help="self-play processes; default is one per CPU core",
+    )
     train.set_defaults(func=cmd_train)
 
     status = sub.add_parser("status", help="show run progress")

@@ -142,6 +142,7 @@ def test_full_chess_generation_and_resume(tmp_path):
     )
     config.train.update(steps_per_generation=2, batch_size=8, max_positions=200)
     config.net = dict(blocks=1, filters=16, value_hidden=16)
+    config.selfplay_processes = 1  # in-process: subprocess startup would dominate
 
     run_dir = tmp_path / "chess_run"
     session = TrainingSession(run_dir, config=config, device="cpu")

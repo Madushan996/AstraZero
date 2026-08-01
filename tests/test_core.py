@@ -7,6 +7,8 @@ These tests pin the conventions down.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -407,6 +409,9 @@ def test_pipeline_runs_a_generation_and_resumes(tmp_path):
     config = default_config("connect4", profile="tiny")
     config.selfplay.update(num_games=4, parallel_games=4, num_simulations=8)
     config.train.update(steps_per_generation=3, batch_size=16)
+    # In-process: spawning interpreters that each import torch would dominate the
+    # runtime of a test this small. The multi-process path has its own tests.
+    config.selfplay_processes = 1
 
     session = TrainingSession(run_dir, config=config, device="cpu")
     session.run_generation()
@@ -425,11 +430,42 @@ def test_pipeline_runs_a_generation_and_resumes(tmp_path):
     assert len(resumed.manager.read_history()) == 2
 
 
+def test_pipeline_multiprocess_selfplay_works_on_a_fresh_run(tmp_path):
+    """Regression: children load weights from DISK, but a brand-new run has only
+    built the network in memory. Generation 0 died with "no checkpoint" until the
+    session learned to persist the initial network before spawning."""
+    run_dir = tmp_path / "run"
+    config = default_config("connect4", profile="tiny")
+    config.selfplay.update(num_games=4, parallel_games=4, num_simulations=8)
+    config.train.update(steps_per_generation=2, batch_size=16)
+    config.selfplay_processes = 2
+
+    session = TrainingSession(run_dir, config=config, device="cpu")
+    entry = session.run_generation()
+
+    assert entry["selfplay"]["games"] > 0, f"no games produced: {entry['selfplay']}"
+    assert entry["selfplay"]["processes"] == 2
+    assert session.run_state.total_games > 0
+    # One shard per child process.
+    assert len(list((run_dir / "games").glob("*.jsonl.gz"))) >= 2
+
+
+def test_effective_processes_defaults_to_one_per_core(tmp_path):
+    config = default_config("connect4", profile="tiny")
+    session = TrainingSession(tmp_path / "run", config=config, device="cpu")
+
+    assert session.effective_processes() == max(1, min(os.cpu_count() or 1, 8))
+
+    session.config.selfplay_processes = 3
+    assert session.effective_processes() == 3
+
+
 def test_pipeline_refuses_incompatible_architecture_change(tmp_path):
     run_dir = tmp_path / "run"
     config = default_config("connect4", profile="tiny")
     config.selfplay.update(num_games=2, parallel_games=2, num_simulations=8)
     config.train.update(steps_per_generation=1, batch_size=8)
+    config.selfplay_processes = 1
     TrainingSession(run_dir, config=config, device="cpu")
 
     bigger = PipelineConfig.from_dict(config.to_dict())
