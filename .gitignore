@@ -8,6 +8,10 @@ engines/
 beam_seed/
 logo_b64.txt
 
+# Staging folders built by kaggle_setup.py
+kaggle_upload/
+kaggle_notebook/
+
 # Beam syncs the working directory to its containers; this is its ignore file,
 # not something a cloner needs.
 .beamignore

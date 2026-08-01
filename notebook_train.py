@@ -50,17 +50,44 @@ def default_store(environment: str) -> Path:
 
 
 def find_previous_run(environment: str, store: Path, run_name: str) -> Optional[Path]:
-    """Locate a run saved by an earlier session, if there is one."""
-    candidate = store / run_name
-    if (candidate / "config.json").exists():
-        return candidate
+    """Locate a run saved by an earlier session, if there is one.
 
+    Searches several layouts because a Kaggle dataset can be attached with the run at
+    its root (/kaggle/input/my-run/config.json) or nested one level down
+    (/kaggle/input/my-run/astrazero/config.json), depending on how it was uploaded.
+    Guessing wrong means silently starting from scratch and throwing away the buffer,
+    so check both rather than assume.
+    """
+    searched = [store / run_name, store]
     if environment == "kaggle":
-        # Attached datasets are read-only, so the run is copied out before use.
         for attached in sorted(Path("/kaggle/input").glob("*")):
-            found = attached / run_name
-            if (found / "config.json").exists():
-                return found
+            searched.extend([attached / run_name, attached])
+
+    for candidate in searched:
+        if (candidate / "config.json").exists() and (candidate / "games").is_dir():
+            return candidate
+
+    # Datasets uploaded with --dir-mode zip arrive as a single archive rather than an
+    # extracted tree. Unpack it rather than reporting "no previous run" -- that failure
+    # looks exactly like a fresh start and would silently discard the whole buffer.
+    return _extract_archive(environment, run_name)
+
+
+def _extract_archive(environment: str, run_name: str) -> Optional[Path]:
+    import zipfile
+
+    roots = [Path("/kaggle/input")] if environment == "kaggle" else []
+    for root in roots:
+        for archive in sorted(root.glob("*/*.zip")):
+            destination = Path("/kaggle/working/_unpacked") / archive.stem
+            if not destination.exists():
+                print(f"unpacking {archive.name} ...")
+                destination.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(archive) as bundle:
+                    bundle.extractall(destination)
+            for candidate in (destination / run_name, destination):
+                if (candidate / "config.json").exists() and (candidate / "games").is_dir():
+                    return candidate
     return None
 
 
