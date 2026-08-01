@@ -1,0 +1,15 @@
+# Core
+numpy>=1.24
+python-chess>=1.10
+
+# Install torch separately so you get the right build for your machine:
+#   CPU only:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA 12.4: pip install torch --index-url https://download.pytorch.org/whl/cu124
+# (Modal containers get their own CUDA build; see modal_app.py)
+torch>=2.1
+
+# Cloud training
+modal>=0.64
+
+# Tests
+pytest>=7.4
