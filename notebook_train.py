@@ -170,6 +170,27 @@ def persist(work: Path, store: Path, run_name: str, keep_checkpoints: int = 2) -
     )
 
 
+# Measured seconds of one worker process per (ply x simulation x concurrent game),
+# with the network on a GPU. CPU-only inference is roughly 2.5x slower.
+SECONDS_PER_PLY_SIM_GAME = 0.0012
+TYPICAL_PLIES = 180
+
+
+def safe_parallel(simulations: int, window_seconds: float, on_gpu: bool) -> int:
+    """Largest batch width whose games can actually finish inside a generation.
+
+    A worker plays `parallel` games at once and they complete together, so a batch that
+    outlasts the generation produces NOTHING while costing the full time. The stored
+    config carries `parallel_games: 96` from a cloud profile; on a notebook CPU that is
+    a ~10,000 second batch against a ~600 second window.
+    """
+    per_game = SECONDS_PER_PLY_SIM_GAME * TYPICAL_PLIES * simulations
+    if not on_gpu:
+        per_game *= 2.5
+    # Two batches per generation, so a slow one still leaves something completed.
+    return max(2, int(window_seconds / (per_game * 2)))
+
+
 def _describe_inputs(limit: int = 25) -> str:
     """List what is actually mounted, so a failed lookup is diagnosable from the log."""
     root = Path("/kaggle/input")
@@ -194,7 +215,7 @@ def session(
     store: Optional[str] = None,
     profile: str = "balanced",
     simulations: int = 200,
-    parallel: int = 16,
+    parallel: int = 0,  # 0 = size it from the session length and device
     processes: int = 0,
     reserve_minutes: float = 12.0,
     allow_new_run: bool = False,
@@ -237,10 +258,22 @@ def session(
 
     training = TrainingSession(work, config=config)
     training.config.selfplay_processes = processes
-    print(f"generation {training.run_state.generation}, "
-          f"{training.run_state.total_games} games so far")
 
     minutes = max(1.0, hours * 60 - reserve_minutes)
+
+    # Search width and depth are per-session tuning, not part of the run definition, so
+    # override whatever the stored config inherited from a cloud profile. Sizing this to
+    # the actual machine is what stops a session producing zero games.
+    window = (minutes * 60) / 4 * 0.8  # roughly one generation's self-play budget
+    on_gpu = training.device.type == "cuda"
+    chosen = parallel or safe_parallel(simulations, window, on_gpu)
+    training.config.selfplay["num_simulations"] = simulations
+    training.config.selfplay["parallel_games"] = chosen
+    print(
+        f"generation {training.run_state.generation}, "
+        f"{training.run_state.total_games} games so far | "
+        f"{simulations} sims x {chosen} parallel on {training.device.type}"
+    )
     started = time.time()
     try:
         training.run_session(minutes=minutes)
