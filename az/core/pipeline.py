@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from az.core.checkpoint import CheckpointManager, RunState
+from az.core.device import select_device
 from az.core.game import Game, make_game
 from az.core.mcts import torch_evaluator
 from az.core.network import AlphaZeroNet, NetConfig, build_network, net_config_for
@@ -139,8 +140,10 @@ class TrainingSession:
                 self._assert_compatible(stored, config)
                 self.manager.write_config(config.to_dict())
 
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Probe rather than trust torch.cuda.is_available(): it says True on GPUs this
+        # build has no kernels for, and the failure only appears once work starts.
+        self.device = (
+            torch.device(device) if device else select_device("cuda")
         )
         self.game: Game = make_game(self.config.game_name, **self.config.game_kwargs)
         self.buffer = ReplayBuffer(

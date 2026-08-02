@@ -65,8 +65,10 @@ def find_previous_run(environment: str, store: Path, run_name: str) -> Optional[
     """
     searched = [store / run_name, store]
     if environment == "kaggle":
-        for attached in sorted(Path("/kaggle/input").glob("*")):
-            searched.extend([attached / run_name, attached])
+        # Any depth: Kaggle's layout depends on how the dataset was uploaded, and
+        # guessing wrong has already cost two sessions.
+        for config in sorted(Path("/kaggle/input").rglob("config.json")):
+            searched.append(config.parent)
 
     for candidate in searched:
         if (candidate / "config.json").exists() and (candidate / "games").is_dir():
@@ -168,6 +170,24 @@ def persist(work: Path, store: Path, run_name: str, keep_checkpoints: int = 2) -
     )
 
 
+def _describe_inputs(limit: int = 25) -> str:
+    """List what is actually mounted, so a failed lookup is diagnosable from the log."""
+    root = Path("/kaggle/input")
+    if not root.exists():
+        return f"  {root} does not exist (is a dataset attached?)"
+
+    lines = [f"  contents of {root}:"]
+    entries = sorted(root.rglob("*"))
+    if not entries:
+        lines.append("    (empty -- no dataset attached to this notebook)")
+    for path in entries[:limit]:
+        kind = "DIR " if path.is_dir() else f"{path.stat().st_size:>10,}"
+        lines.append(f"    {kind}  {path}")
+    if len(entries) > limit:
+        lines.append(f"    ... and {len(entries) - limit} more")
+    return "\n".join(lines)
+
+
 def session(
     hours: float = 8.0,
     run_name: str = "chess",
@@ -177,6 +197,7 @@ def session(
     parallel: int = 16,
     processes: int = 0,
     reserve_minutes: float = 12.0,
+    allow_new_run: bool = False,
 ) -> None:
     """Restore, train for `hours`, save back.
 
@@ -195,14 +216,24 @@ def session(
     print(f"environment: {environment} | {cores} CPU core(s) | "
           f"{processes} self-play process(es)")
 
+    print(_describe_inputs())
     resumed = restore(environment, store_path, run_name, work)
     config = None
     if not resumed:
+        if not allow_new_run:
+            # Starting from scratch must be a decision, never a fallback. Twice now a
+            # session trained a fresh network for its whole duration because discovery
+            # failed silently, and the logs looked healthy the entire time.
+            raise RuntimeError(
+                "no previous run found, and allow_new_run is False.\n"
+                + _describe_inputs()
+                + "\nIf you really want to start from zero, pass allow_new_run=True."
+            )
         config = default_config("chess", profile=profile)
         config.selfplay["num_simulations"] = simulations
         config.selfplay["parallel_games"] = parallel
         config.game_kwargs["adjudicate_material_at"] = 5
-        print("no previous run found -- starting a new one")
+        print("starting a NEW run (allow_new_run=True)")
 
     training = TrainingSession(work, config=config)
     training.config.selfplay_processes = processes

@@ -54,8 +54,10 @@ def run_selfplay_shard(
     manager = CheckpointManager(Path(run_dir))
     config = PipelineConfig.from_dict(manager.read_config())
 
-    use_cuda = device_preference == "cuda" and torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
+    from az.core.device import select_device
+
+    device = select_device(device_preference)
+    use_cuda = device.type == "cuda"
 
     checkpoint = manager.load(map_location="cpu")
     if checkpoint is None:
