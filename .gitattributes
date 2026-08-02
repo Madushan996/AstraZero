@@ -1,0 +1,7 @@
+# Binary assets must not get line-ending conversion. Git guessed the report PDF was
+# text and would have rewritten LF to CRLF inside it, corrupting the file on checkout.
+*.pdf binary
+*.png binary
+*.bmp binary
+*.pt binary
+*.gz binary

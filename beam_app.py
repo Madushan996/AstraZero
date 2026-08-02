@@ -62,6 +62,9 @@ MIN_GENERATION_SECONDS = 600.0
 
 # Seed directory synced from the working tree (see seed_volume below).
 SEED_DIR = "beam_seed"
+# Where checkpoints trained elsewhere are staged for upload. Synced with the code,
+# so keep it small and remove it from .beamignore only while installing.
+STAGE_DIR = "beam_stage"
 
 image = Image(
     python_version="python3.11",
@@ -111,6 +114,57 @@ def seed_volume(run_name: str = "chess") -> dict[str, Any]:
         "status": "seeded",
         "shards_copied": copied,
         "shards_total": total,
+        "run_dir": str(target),
+    }
+
+
+@function(image=image, volumes=[volume], cpu=2, memory=4096, timeout=1800)
+def install_checkpoints(run_name: str = "astrazero") -> dict[str, Any]:
+    """Copy checkpoints staged in beam_stage/ onto the volume.
+
+    Beam volumes have no upload command, so the only way in is the working directory
+    Beam already syncs to build the container. Weights arrive stripped of optimizer
+    state -- a match only does forward passes, and that turns 146 MB per checkpoint
+    into 49 MB.
+
+    Exists because generations trained on other platforms (Modal, Kaggle) have no
+    other route onto this volume, and a gate match needs both sides present.
+    """
+    source = Path(STAGE_DIR) / run_name
+    if not source.exists():
+        return {"status": f"no {STAGE_DIR}/{run_name}/ was synced; check .beamignore"}
+
+    target = _run_dir(run_name)
+    (target / "checkpoints").mkdir(parents=True, exist_ok=True)
+
+    installed = []
+    for directory in sorted((source / "checkpoints").glob("gen*")):
+        destination = target / "checkpoints" / directory.name
+        if not destination.exists():
+            shutil.copytree(directory, destination)
+            installed.append(directory.name)
+
+    # Games too: a checkpoint alone cannot train. The trainer samples the newest few
+    # thousand games out of the buffer, so a run migrated without shards would resume
+    # at the right generation and then train on nothing.
+    (target / "games").mkdir(exist_ok=True)
+    shards = 0
+    for shard in (source / "games").glob("*.jsonl.gz"):
+        destination = target / "games" / shard.name
+        if not destination.exists():
+            shutil.copy2(shard, destination)
+            shards += 1
+
+    for name in ("config.json", "latest.json"):
+        if not (target / name).exists() and (source / name).exists():
+            shutil.copy2(source / name, target / name)
+
+    return {
+        "status": "installed",
+        "installed": installed,
+        "shards_copied": shards,
+        "shards_total": len(list((target / "games").glob("*.jsonl.gz"))),
+        "available": sorted(p.name for p in (target / "checkpoints").glob("gen*")),
         "run_dir": str(target),
     }
 
@@ -169,8 +223,20 @@ def init_run(
     volumes=[volume],
     gpu=SELFPLAY_GPU,
     # MCTS tree descent is pure Python, so a starved worker leaves its GPU idle.
-    cpu=4,
-    memory=4096,
+    #
+    # Eight, and do not raise it. The GPU is a fixed $0.69/hr while a core is $0.045,
+    # so packing every core onto one container looks like it should be far cheaper per
+    # game. Measured, it is not: throughput scales as roughly N^0.35, so 8 processes
+    # give 79 games/hr each and 30 give 33 each.
+    #
+    #   1 x 8    631 games/hr   $1.11/hr   $1.76 per 1,000
+    #   3 x 8   1893 games/hr   $3.33/hr   $1.76 per 1,000
+    #   1 x 30  1003 games/hr   $2.27/hr   $2.26 per 1,000   <- 28% worse
+    #
+    # Cost per game is flat from ~6 to ~8 processes and degrades on either side, so
+    # scale by adding containers, not cores. Contention is on the GPU and the volume.
+    cpu=8,
+    memory=8192,
     timeout=3600,
     retries=1,
 )
@@ -515,13 +581,21 @@ def probe_nested_call(run_name: str = "chess") -> dict[str, Any]:
 
 @function(image=image, volumes=[volume], cpu=2, memory=8192, timeout=900)
 def prepare_export(
-    run_name: str = "chess", generation: Optional[int] = None
+    run_name: str = "chess",
+    generation: Optional[int] = None,
+    full: bool = False,
 ) -> dict[str, Any]:
-    """Write a play-only checkpoint to the volume, ready to be fetched in chunks.
+    """Write a checkpoint to the volume, ready to be fetched in chunks.
 
     Beam has no volume download in this SDK, so getting a checkpoint onto a laptop
-    means streaming it back through function calls. Optimizer state is stripped first:
-    it is two thirds of the file and is useless for playing, taking 145 MB down to ~48.
+    means streaming it back through function calls. Optimizer state is stripped by
+    default: it is two thirds of the file and is useless for playing, taking 145 MB
+    down to ~48.
+
+    Pass `full=True` to keep it. Training resumed from a stripped checkpoint restarts
+    Adam's moment estimates and the LR schedule from zero, which after tens of
+    thousands of steps means the network wobbles before it settles again. If this copy
+    is the only one that will survive the volume, it needs to be the full one.
     """
     import hashlib
 
@@ -543,22 +617,29 @@ def prepare_export(
 
     export_dir = _run_dir(run_name) / "export"
     export_dir.mkdir(parents=True, exist_ok=True)
-    path = export_dir / f"gen{generation:05d}_play.pt"
+    kind = "full" if full else "play"
+    path = export_dir / f"gen{generation:05d}_{kind}.pt"
 
-    torch.save(
-        {
-            "net_config": checkpoint.net_config.to_dict(),
-            "game_name": checkpoint.game_name,
-            "game_kwargs": checkpoint.game_kwargs,
-            "run_state": checkpoint.run_state.to_dict(),
-            "model_state": checkpoint.model_state,
-            "optimizer_state": None,
-            "scaler_state": None,
-            "rng_state": {},
-            "extra": {"play_only": True},
-        },
-        path,
-    )
+    if full:
+        # Copy the stored file byte for byte rather than re-serialising it. Round-
+        # tripping through torch.save would produce a valid checkpoint, but the
+        # checksum would then verify our re-encoding rather than what is on the volume.
+        shutil.copy2(manager.generation_dir(generation) / "model.pt", path)
+    else:
+        torch.save(
+            {
+                "net_config": checkpoint.net_config.to_dict(),
+                "game_name": checkpoint.game_name,
+                "game_kwargs": checkpoint.game_kwargs,
+                "run_state": checkpoint.run_state.to_dict(),
+                "model_state": checkpoint.model_state,
+                "optimizer_state": None,
+                "scaler_state": None,
+                "rng_state": {},
+                "extra": {"play_only": True},
+            },
+            path,
+        )
 
     data = path.read_bytes()
     return {
@@ -641,11 +722,12 @@ def fetch_export_chunk(
     generation: int = 0,
     offset: int = 0,
     length: int = 4_000_000,
+    full: bool = False,
 ) -> dict[str, Any]:
     """Return one base64-encoded byte range of the prepared checkpoint export."""
     return fetch_file_chunk.local(
         run_name=run_name,
-        name=f"gen{generation:05d}_play.pt",
+        name=f"gen{generation:05d}_{'full' if full else 'play'}.pt",
         offset=offset,
         length=length,
     )

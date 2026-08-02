@@ -30,7 +30,7 @@ def _download(beam_app, args) -> dict:
     from pathlib import Path
 
     prepared = beam_app.prepare_export.remote(
-        run_name=args.run_name, generation=args.generation
+        run_name=args.run_name, generation=args.generation, full=args.full
     )
     if prepared.get("status") != "ready":
         return prepared
@@ -48,6 +48,7 @@ def _download(beam_app, args) -> dict:
             generation=generation,
             offset=offset,
             length=chunk,
+            full=args.full,
         )
         if response.get("status") != "ok":
             return {"status": "chunk fetch failed", "at": offset, "detail": response}
@@ -147,6 +148,10 @@ def main() -> int:
 
     sub.add_parser("seed", help="copy beam_seed/ games and config onto the volume")
 
+    sub.add_parser(
+        "install", help="copy checkpoints staged in beam_stage/ onto the volume"
+    )
+
     init = sub.add_parser("init", help="create the run and a generation-0 checkpoint")
     init.add_argument("--game", default="chess")
     init.add_argument("--profile", default="balanced")
@@ -176,6 +181,12 @@ def main() -> int:
         default=4.0,
         help="lower this if a chunk exceeds the gRPC message limit",
     )
+    download.add_argument(
+        "--full",
+        action="store_true",
+        help="keep optimizer state (146 MB, not 49). Needed to RESUME TRAINING from "
+        "this copy; without it Adam and the LR schedule restart from zero.",
+    )
 
     games = sub.add_parser(
         "download-games", help="fetch the whole replay buffer (for platform migration)"
@@ -200,6 +211,8 @@ def main() -> int:
 
     if args.command == "seed":
         result = beam_app.seed_volume.remote(run_name=args.run_name)
+    elif args.command == "install":
+        result = beam_app.install_checkpoints.remote(run_name=args.run_name)
     elif args.command == "init":
         result = beam_app.init_run.remote(
             run_name=args.run_name, game=args.game, profile=args.profile

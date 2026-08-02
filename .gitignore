@@ -8,6 +8,9 @@ engines/
 beam_seed/
 logo_b64.txt
 
+# Staging for checkpoints uploaded to a Beam volume (hundreds of MB).
+beam_stage/
+
 # Staging folders built by kaggle_setup.py
 kaggle_upload/
 kaggle_notebook/
