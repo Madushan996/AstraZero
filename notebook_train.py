@@ -35,6 +35,10 @@ from typing import Optional
 KAGGLE_SAFE_SUFFIX = ".shard"
 
 
+def environment_is_kaggle() -> bool:
+    return detect_environment() == "kaggle"
+
+
 def detect_environment() -> str:
     if Path("/kaggle/working").exists():
         return "kaggle"
@@ -148,9 +152,18 @@ def persist(work: Path, store: Path, run_name: str, keep_checkpoints: int = 2) -
 
     games = target / "games"
     games.mkdir(exist_ok=True)
+
+    # Save shards under an extension Kaggle's dataset pipeline ignores. Anything ending
+    # in .gz gets auto-decompressed when the output is turned into a Dataset, which
+    # silently destroyed a 400-shard buffer -- the next session then restored 0 shards.
+    # restore() renames them back on the way in.
+    safe = environment_is_kaggle()
     copied = 0
     for shard in (work / "games").glob("*.jsonl.gz"):
-        destination = games / shard.name
+        name = (
+            shard.name.replace(".jsonl.gz", KAGGLE_SAFE_SUFFIX) if safe else shard.name
+        )
+        destination = games / name
         if not destination.exists():
             shutil.copy2(shard, destination)
             copied += 1
