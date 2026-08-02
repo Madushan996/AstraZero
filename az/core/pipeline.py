@@ -12,6 +12,7 @@ engine.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import time
@@ -355,6 +356,7 @@ class TrainingSession:
         generations: Optional[int] = None,
         selfplay_fraction: float = 0.8,
         verbose: bool = True,
+        min_games: int = 0,
     ) -> list[dict[str, Any]]:
         """Run until the time budget or generation count is exhausted.
 
@@ -382,9 +384,21 @@ class TrainingSession:
 
                 if deadline is not None:
                     remaining = deadline - time.time()
-                    # Aim for ~8 generations per session so progress is checkpointed
-                    # often, but never let one be so short it produces no games.
-                    target = max(60.0, min(remaining, remaining / 4 + 60))
+                    # A generation shorter than one batch of `parallel_games` returns
+                    # almost nothing, because those games only finish together. Observed
+                    # on Kaggle: 131, 93, 49, 14, 7 games as generations shrank, wasting
+                    # the last fifth of the session.
+                    floor = self.minimum_generation_seconds(
+                        selfplay_fraction, min_games
+                    )
+                    if remaining < floor:
+                        print(
+                            f"\n[stop] {remaining / 60:.1f} min left, below the "
+                            f"{floor / 60:.1f} min needed for a generation of "
+                            f"{min_games or 'one batch of'} games."
+                        )
+                        break
+                    target = min(remaining, max(floor, remaining / 4 + 60))
                     selfplay_seconds = target * selfplay_fraction
                 else:
                     selfplay_seconds = None
@@ -434,6 +448,39 @@ class TrainingSession:
         if configured and configured > 0:
             return configured
         return max(1, min(os.cpu_count() or 1, 8))
+
+    # Measured seconds of one worker process per (ply x simulation x concurrent game)
+    # with the network on a GPU. CPU-only inference is roughly 2.5x slower.
+    SECONDS_PER_PLY_SIM_GAME = 0.0012
+    TYPICAL_PLIES = 180
+
+    def minimum_generation_seconds(
+        self, selfplay_fraction: float = 0.8, min_games: int = 0
+    ) -> float:
+        """How long a generation must run to be worth having.
+
+        Two constraints. A worker plays `parallel_games` at once and they complete
+        together, so anything shorter than one batch costs full time and returns
+        nothing. And a generation that yields only a handful of games barely moves a
+        26,000-game buffer, so `min_games` sets a floor on what is worth a training step.
+        """
+        selfplay = self.config.selfplay_config()
+        parallel = max(1, selfplay.parallel_games)
+        per_batch = (
+            self.SECONDS_PER_PLY_SIM_GAME
+            * self.TYPICAL_PLIES
+            * selfplay.num_simulations
+            * parallel
+        )
+        if self.device.type != "cuda":
+            per_batch *= 2.5
+
+        batches = 1
+        if min_games > 0:
+            games_per_batch = parallel * self.effective_processes()
+            batches = max(1, math.ceil(min_games / max(games_per_batch, 1)))
+
+        return max(60.0, per_batch * batches * 1.2 / max(selfplay_fraction, 0.1))
 
     def housekeeping(self) -> None:
         """Drop stale checkpoints and shards. Called at the end of a session."""

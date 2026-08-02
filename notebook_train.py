@@ -218,6 +218,7 @@ def session(
     parallel: int = 0,  # 0 = size it from the session length and device
     processes: int = 0,
     reserve_minutes: float = 12.0,
+    min_games: int = 200,
     allow_new_run: bool = False,
 ) -> None:
     """Restore, train for `hours`, save back.
@@ -276,7 +277,7 @@ def session(
     )
     started = time.time()
     try:
-        training.run_session(minutes=minutes)
+        training.run_session(minutes=minutes, min_games=min_games)
     except KeyboardInterrupt:
         print("interrupted -- saving what completed")
     finally:

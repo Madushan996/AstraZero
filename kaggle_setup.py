@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -110,7 +111,13 @@ sys.path.insert(0, "/kaggle/working/AstraZero")
 os.chdir("/kaggle/working/AstraZero")
 
 from notebook_train import session
-session(hours={hours}, run_name="astrazero", simulations={simulations})
+session(
+    hours={hours},
+    run_name="astrazero",
+    simulations={simulations},
+    parallel={parallel},
+    min_games={min_games},
+)
 """
 
 
@@ -122,6 +129,8 @@ def notebook(
     hours: float,
     accelerator: str = "NvidiaTeslaT4",
     simulations: int = 200,
+    parallel: int = 50,
+    min_games: int = 200,
 ) -> None:
     """Write and push a notebook that trains and saves its output.
 
@@ -140,7 +149,11 @@ def notebook(
     NOTEBOOK_DIR.mkdir(parents=True)
 
     source = NOTEBOOK_SOURCE.format(
-        repo=repo, hours=hours, simulations=simulations
+        repo=repo,
+        hours=hours,
+        simulations=simulations,
+        parallel=parallel,
+        min_games=min_games,
     )
     cells = [{
         "cell_type": "code", "metadata": {}, "execution_count": None,
@@ -190,6 +203,18 @@ def notebook(
     print(f"\nwatch it at https://www.kaggle.com/code/{username}/{slug}")
 
 
+def _run_progress(run_dir: Path) -> tuple[int, int]:
+    """(generation, shard count) for a run directory -- how far along it is."""
+    generation = 0
+    latest = run_dir / "latest.json"
+    if latest.exists():
+        try:
+            generation = int(json.loads(latest.read_text(encoding="utf-8"))["generation"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+    return generation, len(list((run_dir / "games").glob("*")))
+
+
 def harvest(
     notebook_slug: str,
     username: str,
@@ -208,30 +233,88 @@ def harvest(
     """
     import tempfile
 
+    from kaggle.api.kaggle_api_extended import KaggleApi
+
     download = Path(tempfile.mkdtemp()) / "output"
     download.mkdir(parents=True)
     print(f"downloading output of {username}/{notebook_slug} ...")
-    subprocess.run(
-        [sys.executable, "-m", "kaggle", "kernels", "output",
-         f"{username}/{notebook_slug}", "-p", str(download)],
-        check=False,
-    )
 
-    # The notebook persists to /kaggle/working/<run_name>, so that is what comes back.
-    candidates = [download / run_name, download]
-    source = next(
-        (c for c in candidates
-         if (c / "config.json").exists() and (c / "games").is_dir()),
-        None,
-    )
+    # Use the Python API rather than the CLI: the download is paginated at 20 files per
+    # page, and a shell invocation quietly stopped at 495 of ~700 files. Because files
+    # arrive in name order, the truncation landed exactly on the newest generations --
+    # so the harvest looked successful while silently missing everything the run
+    # produced. A large page size plus an explicit count check makes that visible.
+    api = KaggleApi()
+    api.authenticate()
+
+    # Fetch only the run. The output also contains the cloned repo (git objects,
+    # __pycache__) and a duplicate working copy -- roughly two thirds of the bytes,
+    # none of it wanted, and a likely source of the encoding failures seen when
+    # downloading everything.
+    patterns = [r"(config\.json|latest\.json|history\.jsonl|games/|checkpoints/)", None]
+    files: list = []
+    for pattern in patterns:
+        try:
+            files, _ = api.kernels_output(
+                f"{username}/{notebook_slug}",
+                path=str(download),
+                file_pattern=pattern,
+                force=True,
+                quiet=True,
+                page_size=500,
+            )
+            print(f"  {len(files)} files downloaded"
+                  + (f" (pattern {pattern!r})" if pattern else " (everything)"))
+            if files:
+                break
+        except Exception as error:
+            print(f"  download attempt failed: {type(error).__name__}: "
+                  f"{str(error)[:160]}")
+
+    if not any(download.rglob("config.json")):
+        print("nothing usable downloaded; the run is still safe on Kaggle -- retry.")
+        return
+
+    # Search at any depth rather than assuming a layout: the store path and the run name
+    # both contribute directories, so the run turns up at <out>/astrazero/astrazero.
+    # Several candidates can match (the persisted store AND the working copy), so pick
+    # the one that is furthest along rather than the first found -- an earlier harvest
+    # took a stale copy and reported success.
+    candidates = [
+        config.parent
+        for config in sorted(download.rglob("config.json"))
+        if (config.parent / "games").is_dir()
+    ]
+    source = max(candidates, key=_run_progress, default=None)
+    if candidates:
+        for candidate in candidates:
+            generation, games = _run_progress(candidate)
+            marker = " <- chosen" if candidate == source else ""
+            print(f"  candidate {candidate.name}: gen {generation}, "
+                  f"{games} shards{marker}")
+
     if source is None:
-        found = sorted(p.name for p in download.iterdir())[:10] if download.exists() else []
+        found = sorted(str(p.relative_to(download)) for p in download.rglob("*"))[:12]
         print(f"no run found in the output. contents: {found}")
         print("If the session was cancelled rather than completed, there is no output.")
         return
 
-    shards = len(list((source / "games").glob("*")))
-    print(f"found run at {source} ({shards} shard files)")
+    generation, shards = _run_progress(source)
+    print(f"found run at {source}: generation {generation}, {shards} shard files")
+
+    # A harvest that has not advanced is a red flag, not a no-op: it means the download
+    # was truncated or the wrong copy was picked. Publishing it would burn a dataset
+    # version on stale data and, worse, suggest the session achieved nothing.
+    if local is not None and (Path(local) / "latest.json").exists():
+        previous, _ = _run_progress(Path(local))
+        if generation <= previous:
+            print(
+                f"\nREFUSING to publish: harvested generation {generation} is not ahead "
+                f"of the local copy at generation {previous}.\n"
+                f"The download was probably incomplete -- rerun harvest."
+            )
+            return
+        print(f"  advancing local copy: generation {previous} -> {generation}")
 
     # Keep a local copy BEFORE touching the dataset. Kaggle keeps every dataset version,
     # so history is safe there too, but a copy on your own disk is the backup that does
@@ -266,7 +349,34 @@ def harvest(
     upload(dataset_slug, username, f"harvested from {notebook_slug}")
 
 
+def _make_output_utf8_safe() -> None:
+    """Ensure UTF-8 everywhere, then re-exec if the interpreter was not started that way.
+
+    kernels_output finishes by writing the notebook's log to disk with open()'s default
+    encoding. On Windows that is cp1252, and a notebook log containing pip's progress
+    bars (U+2501) raises UnicodeEncodeError *after* every file has downloaded -- the
+    exception then discards the entire result. Three harvest attempts died this way.
+
+    PYTHONIOENCODING does not help: it governs stdio, not open(). PYTHONUTF8 does, but
+    only if set before the interpreter starts, hence the re-exec.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    if sys.flags.utf8_mode or os.environ.get("_ASTRAZERO_UTF8"):
+        return
+    environment = dict(os.environ, PYTHONUTF8="1", _ASTRAZERO_UTF8="1")
+    print("[setup] restarting in UTF-8 mode so the Kaggle client can write its log")
+    raise SystemExit(
+        subprocess.run([sys.executable, "-X", "utf8", *sys.argv], env=environment).returncode
+    )
+
+
 def main() -> int:
+    _make_output_utf8_safe()
     parser = argparse.ArgumentParser(description="Kaggle staging and launch")
     parser.add_argument(
         "command", choices=["stage", "upload", "notebook", "harvest", "status"]
@@ -278,6 +388,18 @@ def main() -> int:
     parser.add_argument("--repo", default="Madushan996/AstraZero")
     parser.add_argument("--hours", type=float, default=8.5)
     parser.add_argument("--simulations", type=int, default=200)
+    parser.add_argument(
+        "--parallel-games",
+        type=int,
+        default=50,
+        help="concurrent games per self-play process; x4 processes = games per batch",
+    )
+    parser.add_argument(
+        "--min-games",
+        type=int,
+        default=200,
+        help="minimum games a generation must produce before it trains",
+    )
     parser.add_argument(
         "--local",
         type=Path,
@@ -318,6 +440,8 @@ def main() -> int:
             f"{args.username}/{args.dataset_slug}", args.repo, args.hours,
             accelerator=args.accelerator,
             simulations=args.simulations,
+            parallel=args.parallel_games,
+            min_games=args.min_games,
         )
     return 0
 

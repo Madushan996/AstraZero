@@ -36,6 +36,8 @@ def run_selfplay_shard(
     parallel: int = 0,
     seed: Optional[int] = None,
     device_preference: str = "cuda",
+    progress_every: int = 10,
+    summary_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Play games and write one shard. Module-level so it survives spawn pickling."""
     import torch
@@ -99,11 +101,26 @@ def run_selfplay_shard(
     if parallel > 0:
         selfplay_config.parallel_games = parallel
 
+    # Report progress as games land. A generation can run for half an hour, and without
+    # this a long session shows nothing between generation lines -- indistinguishable
+    # from a hang.
+    started_at = time.time()
+
+    def report(count: int, record) -> None:
+        if count % progress_every == 0:
+            rate = count / max(time.time() - started_at, 1e-6) * 3600
+            print(
+                f"  [{worker_tag}] {count} games "
+                f"({(time.time() - started_at) / 60:.1f} min, {rate:.0f}/hr)",
+                flush=True,
+            )
+
     result = play_games(
         game,
         torch_evaluator(net, device, use_amp=use_cuda),
         selfplay_config,
         generation=checkpoint.run_state.generation,
+        on_game_finished=report if progress_every > 0 else None,
     )
 
     if result.records:
@@ -113,7 +130,12 @@ def run_selfplay_shard(
             worker=worker_tag,
         )
 
-    return {"worker": worker_tag, **result.summary()}
+    summary = {"worker": worker_tag, **result.summary()}
+    # Written to a file rather than returned on stdout so the parent can let the child's
+    # progress stream straight through to the console.
+    if summary_path:
+        Path(summary_path).write_text(json.dumps(summary), encoding="utf-8")
+    return summary
 
 
 def run_parallel_selfplay(
@@ -125,6 +147,7 @@ def run_parallel_selfplay(
     simulations: int = 0,
     parallel: int = 0,
     device_preference: str = "cuda",
+    progress_every: int = 10,
 ) -> dict[str, Any]:
     """Fan out `processes` self-play workers inside this container and aggregate.
 
@@ -154,20 +177,31 @@ def run_parallel_selfplay(
     # they run concurrently.
     per_process_games = max(1, num_games // processes)
 
+    summaries_dir = Path(run_dir) / "_summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+
     children = []
+    summary_files = []
     for index in range(processes):
+        tag = f"w{worker_id:03d}p{index}"
+        summary_file = summaries_dir / f"{tag}.json"
+        summary_file.unlink(missing_ok=True)
+        summary_files.append(summary_file)
+
         command = [
             sys.executable,
             "-m",
             "az.core.worker",
             "--run-dir", run_dir,
-            "--worker-tag", f"w{worker_id:03d}p{index}",
+            "--worker-tag", tag,
             "--seconds", str(seconds),
             "--num-games", str(per_process_games),
             "--simulations", str(simulations),
             "--parallel", str(parallel),
             "--seed", str((worker_id * 1000 + index) * 7919 + int(time.time()) % 9973),
             "--device", device_preference,
+            "--summary-path", str(summary_file),
+            "--progress-every", str(progress_every),
         ]
         environment = dict(os.environ)
         # Keep each child to one core's worth of torch threads, or they thrash.
@@ -176,7 +210,10 @@ def run_parallel_selfplay(
         children.append(
             subprocess.Popen(
                 command,
-                stdout=subprocess.PIPE,
+                # Inherit stdout/stderr so progress appears live. A generation can run
+                # for half an hour; buffering it until the end makes a working session
+                # look identical to a hung one.
+                stdout=None,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=environment,
@@ -187,26 +224,29 @@ def run_parallel_selfplay(
     # Generous slack over the self-play budget for model load and the deliberate
     # overrun that lets in-flight games finish.
     budget = seconds * 3 + 600
-    for index, child in enumerate(children):
+    for child, summary_file in zip(children, summary_files):
         try:
-            stdout, stderr = child.communicate(timeout=budget)
+            _, stderr = child.communicate(timeout=budget)
         except subprocess.TimeoutExpired:
             child.kill()
-            stdout, stderr = child.communicate()
+            _, stderr = child.communicate()
             summaries.append({"error": "timed out", "games": 0, "positions": 0})
             continue
 
-        summary = _parse_summary(stdout)
-        if summary is None:
-            summaries.append(
-                {
-                    "error": _describe_failure(stderr, child.returncode),
-                    "games": 0,
-                    "positions": 0,
-                }
-            )
-        else:
-            summaries.append(summary)
+        if summary_file.exists():
+            try:
+                summaries.append(json.loads(summary_file.read_text(encoding="utf-8")))
+                continue
+            except json.JSONDecodeError:
+                pass
+
+        summaries.append(
+            {
+                "error": _describe_failure(stderr, child.returncode),
+                "games": 0,
+                "positions": 0,
+            }
+        )
 
     return {
         "processes": processes,
@@ -278,6 +318,8 @@ def _main() -> int:
     parser.add_argument("--parallel", type=int, default=0)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--summary-path")
+    parser.add_argument("--progress-every", type=int, default=10)
     args = parser.parse_args()
 
     summary = run_selfplay_shard(
@@ -289,6 +331,8 @@ def _main() -> int:
         parallel=args.parallel,
         seed=args.seed,
         device_preference=args.device,
+        progress_every=args.progress_every,
+        summary_path=args.summary_path,
     )
     print(SUMMARY_PREFIX + json.dumps(summary), flush=True)
     return 0
