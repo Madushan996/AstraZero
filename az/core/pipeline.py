@@ -271,11 +271,17 @@ class TrainingSession:
             if failures:
                 print(f"  [warn] {len(failures)} self-play child(ren) failed: "
                       f"{failures[0][:160]}")
+            elapsed = time.time() - started
             summary = {
                 "games": games,
                 "positions": positions,
-                "seconds": round(time.time() - started, 1),
+                "seconds": round(elapsed, 1),
                 "processes": processes,
+                # The single-process path reports these via SelfPlayResult.summary();
+                # without them here the progress line reads "0.0s each, 0 plies", which
+                # looks like a failure rather than a missing field.
+                "sec_per_game": round(elapsed / games, 2) if games else 0.0,
+                "avg_plies": round(positions / games, 1) if games else 0.0,
             }
         else:
             evaluator = torch_evaluator(
