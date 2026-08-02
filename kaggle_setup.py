@@ -119,7 +119,7 @@ def notebook(
     dataset: str,
     repo: str,
     hours: float,
-    accelerator: str = "gpu-t4x2",
+    accelerator: str = "NvidiaTeslaT4",
     simulations: int = 200,
 ) -> None:
     """Write and push a notebook that trains and saves its output.
@@ -128,6 +128,11 @@ def notebook(
     assigned a Tesla P100 (sm_60), which Kaggle's own PyTorch build does not support --
     the run then falls back to CPU while still consuming GPU quota. A T4 is sm_75 and
     works. Pass "none" to skip the accelerator entirely and keep the quota.
+
+    NOTE: `machine_shape` is forwarded verbatim and the accepted values are server-side;
+    "gpu-t4x2" was ignored in practice and Kaggle still assigned a P100. The setting that
+    reliably sticks is the Accelerator dropdown in the notebook's own sidebar on
+    kaggle.com -- set it once there and later API pushes inherit it.
     """
     if NOTEBOOK_DIR.exists():
         shutil.rmtree(NOTEBOOK_DIR)
@@ -163,7 +168,11 @@ def notebook(
         "competition_sources": [],
         "kernel_sources": [],
     }
-    if accelerator != "none":
+    # "inherit" keeps the GPU on but sends no machine_shape, so whatever accelerator is
+    # selected in the notebook's own sidebar on kaggle.com applies. That setting is the
+    # one that reliably sticks -- an explicit machine_shape here was ignored and Kaggle
+    # assigned a P100 anyway, so overriding it would only undo a correct UI choice.
+    if accelerator not in ("none", "inherit"):
         metadata["machine_shape"] = accelerator
 
     (NOTEBOOK_DIR / "kernel-metadata.json").write_text(
@@ -171,7 +180,7 @@ def notebook(
     )
 
     command = [sys.executable, "-m", "kaggle", "kernels", "push", "-p", str(NOTEBOOK_DIR)]
-    if accelerator != "none":
+    if accelerator not in ("none", "inherit"):
         command += ["--accelerator", accelerator]
 
     print(f"pushing notebook {username}/{slug} "
@@ -193,10 +202,11 @@ def main() -> int:
     parser.add_argument("--message", default="new generation")
     parser.add_argument(
         "--accelerator",
-        default="gpu-t4x2",
+        default="NvidiaTeslaT4",
         help=(
-            "gpu-t4x2 (works), gpu-p100 (unsupported by Kaggle's PyTorch), "
-            "or none to run on CPU without spending GPU quota"
+            "NvidiaTeslaT4 (works with Kaggle's PyTorch), Gpu (generic -- Kaggle may "
+            "hand you an unsupported P100), inherit (keep the notebook's own setting), "
+            "or none (CPU, spends no GPU quota)"
         ),
     )
     args = parser.parse_args()
