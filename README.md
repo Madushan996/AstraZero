@@ -10,7 +10,7 @@ No opening book. No endgame tablebases. No handcrafted evaluation. No human game
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.5%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![Tests](https://img.shields.io/badge/tests-124%20passing-3D7A57)](tests/)
+[![Tests](https://img.shields.io/badge/tests-129%20passing-3D7A57)](tests/)
 [![License](https://img.shields.io/badge/license-MIT-A87A22)](LICENSE)
 
 </div>
@@ -22,36 +22,46 @@ the training loop, cloud orchestration and a UCI interface. Built to be trained 
 **sessions**: a few hours whenever you have credit, resuming exactly where the last one
 stopped, playable in a real chess GUI in between.
 
-It is currently around **200 Elo** and will lose to you. That is the honest state of a
-project 1,700× short of AlphaZero's compute. What it does have is a working, measured
-pipeline — and two findings that were worth more than any amount of extra training.
+It still plays like a beginner and will probably lose to you. That is the honest state of
+a project three orders of magnitude short of AlphaZero's compute. What it does have is a
+working, measured pipeline — and a few findings that were worth more than any amount of
+extra training.
 
 ## Results
 
 Training loss falls whether or not an engine improves, so the only evidence that counts
-is games over the board.
+is games over the board. Every match below is 40–60 games at equal search depth.
 
 ```
 generation 10 vs generation 0 (untrained)     +33  =24  -3     +191 Elo
 generation 21 vs generation 14                +30   =5  -5     +255 Elo
+generation 33 vs generation 21                +20   =9  -11     +80 Elo
+generation 52 vs generation 33                +36   =2  -2     +436 Elo
 ```
 
-The second match spans the draw-labelling fix described below. Note the draw counts: an
-earlier match between two similar checkpoints drew 46 of 60 games; this one drew 5 of 40.
-The engine started converting material advantages instead of shuffling them into the
-50-move rule — which is a stronger signal than the Elo number on its own.
+Watch the draw counts rather than the Elo. An early match between two similar
+checkpoints drew **46 of 60**; the latest drew **2 of 40**. The engine stopped shuffling
+material advantages into the 50-move rule and started converting them — a stronger
+signal than any single Elo figure.
+
+The +255 spans the draw-labelling fix described below. The +80 is real but thin at 40
+games (95% CI [−13, +186]). The +436 is not ambiguous: z = 11.3, p < 0.0001.
 
 | | value |
 |---|---|
-| Generation | 21 |
-| Self-play games | 26,478 |
-| Positions trained on | 4.2M |
-| Network | 8 blocks × 128 filters, 12.1M parameters |
-| Cost of all training so far | ~$58 |
+| Generation | 52 |
+| Self-play games | 39,404 |
+| Positions trained on | 5.1M |
+| Network | 8 blocks × 128 filters, 12.15M parameters |
+| Cost of all training so far | ~$75 |
 
-## Two things I got wrong, and how they were found
+A full write-up — system, methodology, and the predictions that turned out wrong — is in
+[docs/TECHNICAL_REPORT.md](docs/TECHNICAL_REPORT.md)
+([PDF](docs/AstraZero_Technical_Report.pdf)).
 
-Neither was visible in the loss curve. Both cost real money to discover, so they are
+## Three things I got wrong, and how they were found
+
+None were visible in the loss curve. All cost real money to discover, so they are
 written up here in full.
 
 ### 1. Self-play was wasting 80% of what it paid for
@@ -102,38 +112,64 @@ Measured effect, asking the value head how it rates being a queen up versus a qu
 with no search at all:
 
 ```
-                      gen 14    gen 19    gen 21
-value spread ±queen    0.072     0.261     0.426
-tactics (200 sims)      3/5       4/5       4/5
-capture a free queen   MISS       OK        OK
+                      gen 14    gen 19    gen 21    gen 33
+value spread ±queen    0.072     0.261     0.426     0.638
+tactics (200 sims)      3/5       4/5       4/5       4/5
+capture a free queen   MISS       OK        OK        OK
 ```
+
+Value spread has now predicted the direction of three gate matches in a row, which makes
+it the cheapest useful progress signal in the project — it needs no search and no
+opponent.
 
 This is the only place human chess knowledge enters the system, and it enters purely as a
 training label — never into the network, the encoding, or the search. Set
 `adjudicate_material_at: 0` for a fully knowledge-free run, and expect to need far more
 games.
 
+### 3. The obvious cost optimisation was 28% worse
+
+Beam charges a fixed GPU rate per container plus cheap per-core rates — $0.69/hr for an
+RTX 4090 against $0.045/hr for a core. Since cores produce games and the GPU is barely
+used, packing every core onto **one** container and renting one GPU instead of three
+looks like a large saving. I predicted 83% more games per dollar.
+
+Measured, on the same run:
+
+| shape | games/hr | $/hr | $/1,000 games |
+|---|---|---|---|
+| 1 container × 8 processes | 631 | $1.11 | **$1.76** |
+| 3 containers × 8 processes | 2,073 | $3.33 | **$1.61** |
+| 1 container × 30 processes | 1,003 | $2.27 | $2.26 |
+
+Per-container throughput scales as roughly **N^0.35**: 8 processes give 79 games/hr
+each, 30 give 33 each. The GPU rent saved was smaller than the throughput lost.
+
+The rule is the opposite of the intuition: **scale by adding containers, not cores**, at
+around 6–8 processes each. This cost $1.20 and 45 minutes to learn, because a working
+configuration was changed on the strength of a cost model instead of a 12-minute probe.
+
 ## Play it
 
 ```bash
 pip install -r requirements.txt
-python package_engine.py --run runs/chess_modal --generation 21
+python package_engine.py --run runs/astrazero --generation 52
 ```
 
 That writes a self-contained engine:
 
 ```
 engines/
-    AstraZero_Gen21.bat      point your GUI at this
-    AstraZero_Gen21.bmp      logo
-    AstraZero_Gen21/         weights + config, 49 MB
+    AstraZero_Gen52.bat      point your GUI at this
+    AstraZero_Gen52.bmp      logo
+    AstraZero_Gen52/         weights + config, 49 MB
 ```
 
 In **Arena**: Engines → Install New Engine → select the `.bat` → choose **UCI**.
 Also works with Cute Chess, BanksiaGUI, and anything else that speaks UCI.
 
-Package two generations and they will report distinct names (`AstraZero_Gen21`,
-`AstraZero_Gen14`), so you can run them against each other in a tournament. Watching one
+Package two generations and they will report distinct names (`AstraZero_Gen52`,
+`AstraZero_Gen33`), so you can run them against each other in a tournament. Watching one
 generation beat an earlier one is the most convincing progress signal there is.
 
 > **Give it time to think.** On a CPU-only machine this searches roughly 20–25 nodes per
@@ -167,8 +203,8 @@ single-threaded Python (see finding #1), so cores decide throughput:
 | **Kaggle** | T4 ×2 / P100 | 4 | 9–12 h headless | 30 GPU-h/week | ~350 |
 | **Colab (free)** | T4 | 2 | disconnects on idle | variable | ~175 |
 
-That makes Kaggle roughly **10,500 games a week for free**. For reference, the 26,478
-games in this repo cost about $58 of paid compute — so around two and a half weeks of
+That makes Kaggle roughly **10,500 games a week for free**. For reference, the 39,404
+games in this repo cost about $75 of paid compute — so around four weeks of
 free Kaggle matches it.
 
 ```python
@@ -270,7 +306,7 @@ search, trainer, buffer and checkpoint code.
 The most useful tool in the repo costs nothing to run:
 
 ```bash
-python tactics.py --run runs/chess_modal --simulations 200
+python tactics.py --run runs/astrazero --simulations 200
 ```
 
 It queries the value head directly, with no search, and reports how strongly it separates
