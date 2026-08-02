@@ -29,6 +29,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Extension the run's shards are stored under on Kaggle. Kaggle's dataset pipeline
+# gunzips anything ending in .gz, which corrupted the entire replay buffer the first
+# time this ran. Must match kaggle_setup.py.
+KAGGLE_SAFE_SUFFIX = ".shard"
+
 
 def detect_environment() -> str:
     if Path("/kaggle/working").exists():
@@ -105,8 +110,22 @@ def restore(environment: str, store: Path, run_name: str, work: Path) -> bool:
         shutil.rmtree(work)
     shutil.copytree(previous, work)
 
+    # Shards are uploaded as ".shard" because Kaggle gunzips anything ending in .gz,
+    # which silently corrupted the entire buffer the first time. Put the real extension
+    # back so the replay buffer can find them.
+    renamed = 0
+    for shard in (work / "games").glob(f"*{KAGGLE_SAFE_SUFFIX}"):
+        shard.rename(shard.with_name(shard.name.replace(KAGGLE_SAFE_SUFFIX, ".jsonl.gz")))
+        renamed += 1
+
     shards = len(list((work / "games").glob("*.jsonl.gz")))
-    print(f"restored {previous} -> {work} ({shards} game shards)")
+    print(f"restored {previous} -> {work} ({shards} game shards"
+          + (f", {renamed} renamed)" if renamed else ")"))
+    if shards == 0:
+        raise RuntimeError(
+            f"restored {previous} but found no readable shards. Refusing to continue: "
+            f"training from an empty buffer would discard the run."
+        )
     return True
 
 

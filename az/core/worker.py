@@ -57,12 +57,36 @@ def run_selfplay_shard(
     use_cuda = device_preference == "cuda" and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    checkpoint = manager.load(map_location=str(device))
+    checkpoint = manager.load(map_location="cpu")
     if checkpoint is None:
         raise RuntimeError(f"no checkpoint in {run_dir}")
 
     game = make_game(checkpoint.game_name, **checkpoint.game_kwargs)
-    net = load_net_from_checkpoint(checkpoint, device)
+
+    def build(target: torch.device):
+        model = load_net_from_checkpoint(checkpoint, target)
+        # Force a real forward pass now. torch.cuda.is_available() can be True on a GPU
+        # whose architecture this build has no compiled kernels for, and the failure
+        # (cudaErrorNoKernelImageForDevice) only surfaces when a kernel actually runs --
+        # by which point self-play is under way and the whole shard is lost.
+        channels, height, width = game.observation_shape
+        probe = torch.zeros((1, channels, height, width), device=target)
+        mask = torch.ones((1, game.action_size), dtype=torch.bool, device=target)
+        model.predict(probe, mask)
+        return model
+
+    try:
+        net = build(device)
+    except Exception as error:
+        if device.type != "cuda":
+            raise
+        # Self-play is bound by Python tree search, not the GPU, so CPU is perhaps 20-30%
+        # slower here -- vastly better than producing nothing.
+        print(f"[worker] GPU unusable ({type(error).__name__}: {str(error)[:120]}); "
+              f"falling back to CPU", flush=True)
+        device = torch.device("cpu")
+        use_cuda = False
+        net = build(device)
 
     selfplay_config = config.selfplay_config()
     selfplay_config.num_games = num_games

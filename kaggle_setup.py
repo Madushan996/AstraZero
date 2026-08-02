@@ -24,6 +24,9 @@ from pathlib import Path
 STAGE = Path("kaggle_upload")
 NOTEBOOK_DIR = Path("kaggle_notebook")
 
+# Extension Kaggle's dataset pipeline leaves alone. Must match notebook_train.
+KAGGLE_SAFE_SUFFIX = ".shard"
+
 
 def stage(run_dir: Path, slug: str, username: str, keep_checkpoints: int = 1) -> None:
     """Copy the run into an upload folder, trimming to what a resume actually needs."""
@@ -37,9 +40,15 @@ def stage(run_dir: Path, slug: str, username: str, keep_checkpoints: int = 1) ->
         if source.exists():
             shutil.copy2(source, target / name)
 
+    # Kaggle's dataset pipeline auto-decompresses anything it recognises as an archive.
+    # Uploaded as .jsonl.gz, every shard was gunzipped into a directory containing a
+    # truncated ".partial" file -- the whole replay buffer arrived corrupt. Renaming to
+    # an extension Kaggle ignores gets the bytes through untouched; notebook_train
+    # renames them back when restoring.
     shards = sorted((run_dir / "games").glob("*.jsonl.gz"))
     for shard in shards:
-        shutil.copy2(shard, target / "games" / shard.name)
+        safe = shard.name.replace(".jsonl.gz", KAGGLE_SAFE_SUFFIX)
+        shutil.copy2(shard, target / "games" / safe)
 
     # Only the newest checkpoint travels. Older ones are ~145 MB each and the network
     # can be retrained from the games; the games cannot be recovered from anything.

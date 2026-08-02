@@ -360,6 +360,7 @@ class TrainingSession:
         self.run_state.sessions += 1
         entries: list[dict[str, Any]] = []
         completed = 0
+        empty_generations = 0
 
         with InterruptGuard() as guard:
             while True:
@@ -387,6 +388,22 @@ class TrainingSession:
 
                 if verbose:
                     _print_generation(entry, self.run_state)
+
+                # A generation that produced no games has learned nothing, and the next
+                # one will almost certainly fail the same way. Without this the loop
+                # spins: a Kaggle session once burned six minutes of GPU on 76 empty
+                # generations at four seconds each, all failing identically.
+                if entry["selfplay"].get("games", 0) == 0:
+                    empty_generations += 1
+                    if empty_generations >= 2:
+                        print(
+                            "\n[stop] two consecutive generations produced no games. "
+                            "Check the self-play failures above -- continuing would "
+                            "only repeat them."
+                        )
+                        break
+                else:
+                    empty_generations = 0
 
         self.housekeeping()
         if verbose:
