@@ -109,17 +109,33 @@ sys.path.insert(0, "/kaggle/working/AstraZero")
 os.chdir("/kaggle/working/AstraZero")
 
 from notebook_train import session
-session(hours={hours}, run_name="astrazero")
+session(hours={hours}, run_name="astrazero", simulations={simulations})
 """
 
 
-def notebook(slug: str, username: str, dataset: str, repo: str, hours: float) -> None:
-    """Write and push a notebook that trains and saves its output."""
+def notebook(
+    slug: str,
+    username: str,
+    dataset: str,
+    repo: str,
+    hours: float,
+    accelerator: str = "gpu-t4x2",
+    simulations: int = 200,
+) -> None:
+    """Write and push a notebook that trains and saves its output.
+
+    `accelerator` matters more than it looks. Left to Kaggle's default, a session can be
+    assigned a Tesla P100 (sm_60), which Kaggle's own PyTorch build does not support --
+    the run then falls back to CPU while still consuming GPU quota. A T4 is sm_75 and
+    works. Pass "none" to skip the accelerator entirely and keep the quota.
+    """
     if NOTEBOOK_DIR.exists():
         shutil.rmtree(NOTEBOOK_DIR)
     NOTEBOOK_DIR.mkdir(parents=True)
 
-    source = NOTEBOOK_SOURCE.format(repo=repo, hours=hours)
+    source = NOTEBOOK_SOURCE.format(
+        repo=repo, hours=hours, simulations=simulations
+    )
     cells = [{
         "cell_type": "code", "metadata": {}, "execution_count": None,
         "outputs": [], "source": source.splitlines(keepends=True),
@@ -134,28 +150,33 @@ def notebook(slug: str, username: str, dataset: str, repo: str, hours: float) ->
         encoding="utf-8",
     )
 
+    metadata = {
+        "id": f"{username}/{slug}",
+        "title": "AstraZero training",
+        "code_file": "astrazero-train.ipynb",
+        "language": "python",
+        "kernel_type": "notebook",
+        "is_private": True,
+        "enable_gpu": accelerator != "none",
+        "enable_internet": True,  # needed to clone the repo and pip install
+        "dataset_sources": [dataset],
+        "competition_sources": [],
+        "kernel_sources": [],
+    }
+    if accelerator != "none":
+        metadata["machine_shape"] = accelerator
+
     (NOTEBOOK_DIR / "kernel-metadata.json").write_text(
-        json.dumps({
-            "id": f"{username}/{slug}",
-            "title": "AstraZero training",
-            "code_file": "astrazero-train.ipynb",
-            "language": "python",
-            "kernel_type": "notebook",
-            "is_private": True,
-            "enable_gpu": True,
-            "enable_internet": True,  # needed to clone the repo and pip install
-            "dataset_sources": [dataset],
-            "competition_sources": [],
-            "kernel_sources": [],
-        }, indent=2),
-        encoding="utf-8",
+        json.dumps(metadata, indent=2), encoding="utf-8"
     )
 
-    print(f"pushing notebook {username}/{slug} (dataset: {dataset})...")
-    subprocess.run(
-        [sys.executable, "-m", "kaggle", "kernels", "push", "-p", str(NOTEBOOK_DIR)],
-        check=False,
-    )
+    command = [sys.executable, "-m", "kaggle", "kernels", "push", "-p", str(NOTEBOOK_DIR)]
+    if accelerator != "none":
+        command += ["--accelerator", accelerator]
+
+    print(f"pushing notebook {username}/{slug} "
+          f"(dataset: {dataset}, accelerator: {accelerator})...")
+    subprocess.run(command, check=False)
     print(f"\nwatch it at https://www.kaggle.com/code/{username}/{slug}")
 
 
@@ -168,7 +189,16 @@ def main() -> int:
     parser.add_argument("--notebook-slug", default="astrazero-training")
     parser.add_argument("--repo", default="Madushan996/AstraZero")
     parser.add_argument("--hours", type=float, default=8.5)
+    parser.add_argument("--simulations", type=int, default=200)
     parser.add_argument("--message", default="new generation")
+    parser.add_argument(
+        "--accelerator",
+        default="gpu-t4x2",
+        help=(
+            "gpu-t4x2 (works), gpu-p100 (unsupported by Kaggle's PyTorch), "
+            "or none to run on CPU without spending GPU quota"
+        ),
+    )
     args = parser.parse_args()
 
     if args.command == "stage":
@@ -179,6 +209,8 @@ def main() -> int:
         notebook(
             args.notebook_slug, args.username,
             f"{args.username}/{args.dataset_slug}", args.repo, args.hours,
+            accelerator=args.accelerator,
+            simulations=args.simulations,
         )
     return 0
 
