@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 STAGE = Path("kaggle_upload")
 NOTEBOOK_DIR = Path("kaggle_notebook")
@@ -189,9 +190,87 @@ def notebook(
     print(f"\nwatch it at https://www.kaggle.com/code/{username}/{slug}")
 
 
+def harvest(
+    notebook_slug: str,
+    username: str,
+    dataset_slug: str,
+    run_name: str = "astrazero",
+    local: Optional[Path] = None,
+) -> None:
+    """Pull a finished run's output and push it back as a new dataset version.
+
+    This closes the training loop. Kaggle saves /kaggle/working automatically when a
+    batch session COMPLETES -- clicking "Save Version" does not snapshot a running
+    session, it starts a whole new run from the old dataset, which is how one session's
+    games were lost.
+
+    So: let the run finish, harvest here, and the next session resumes from the result.
+    """
+    import tempfile
+
+    download = Path(tempfile.mkdtemp()) / "output"
+    download.mkdir(parents=True)
+    print(f"downloading output of {username}/{notebook_slug} ...")
+    subprocess.run(
+        [sys.executable, "-m", "kaggle", "kernels", "output",
+         f"{username}/{notebook_slug}", "-p", str(download)],
+        check=False,
+    )
+
+    # The notebook persists to /kaggle/working/<run_name>, so that is what comes back.
+    candidates = [download / run_name, download]
+    source = next(
+        (c for c in candidates
+         if (c / "config.json").exists() and (c / "games").is_dir()),
+        None,
+    )
+    if source is None:
+        found = sorted(p.name for p in download.iterdir())[:10] if download.exists() else []
+        print(f"no run found in the output. contents: {found}")
+        print("If the session was cancelled rather than completed, there is no output.")
+        return
+
+    shards = len(list((source / "games").glob("*")))
+    print(f"found run at {source} ({shards} shard files)")
+
+    # Keep a local copy BEFORE touching the dataset. Kaggle keeps every dataset version,
+    # so history is safe there too, but a copy on your own disk is the backup that does
+    # not depend on any account.
+    if local is not None:
+        local = Path(local)
+        local.mkdir(parents=True, exist_ok=True)
+        (local / "games").mkdir(exist_ok=True)
+
+        for name in ("config.json", "latest.json", "history.jsonl"):
+            if (source / name).exists():
+                shutil.copy2(source / name, local / name)
+
+        added = 0
+        for shard in (source / "games").glob("*"):
+            # Shards travel as .shard to survive Kaggle's auto-decompression.
+            target_name = shard.name.replace(KAGGLE_SAFE_SUFFIX, ".jsonl.gz")
+            destination = local / "games" / target_name
+            if not destination.exists():
+                shutil.copy2(shard, destination)
+                added += 1
+
+        for directory in sorted((source / "checkpoints").glob("gen*")):
+            destination = local / "checkpoints" / directory.name
+            if not destination.exists():
+                shutil.copytree(directory, destination)
+
+        total = len(list((local / "games").glob("*.jsonl.gz")))
+        print(f"local backup -> {local} ({added} new shards, {total} total)")
+
+    stage(source, dataset_slug, username)
+    upload(dataset_slug, username, f"harvested from {notebook_slug}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Kaggle staging and launch")
-    parser.add_argument("command", choices=["stage", "upload", "notebook"])
+    parser.add_argument(
+        "command", choices=["stage", "upload", "notebook", "harvest", "status"]
+    )
     parser.add_argument("--run", type=Path, default=Path("runs/astrazero"))
     parser.add_argument("--username", default="madushan996")
     parser.add_argument("--dataset-slug", default="astrazero-run")
@@ -199,6 +278,12 @@ def main() -> int:
     parser.add_argument("--repo", default="Madushan996/AstraZero")
     parser.add_argument("--hours", type=float, default=8.5)
     parser.add_argument("--simulations", type=int, default=200)
+    parser.add_argument(
+        "--local",
+        type=Path,
+        default=Path("runs/astrazero"),
+        help="local backup directory for harvested runs",
+    )
     parser.add_argument("--message", default="new generation")
     parser.add_argument(
         "--accelerator",
@@ -215,6 +300,18 @@ def main() -> int:
         stage(args.run, args.dataset_slug, args.username)
     elif args.command == "upload":
         upload(args.dataset_slug, args.username, args.message)
+    elif args.command == "harvest":
+        harvest(
+            args.notebook_slug, args.username, args.dataset_slug, local=args.local
+        )
+    elif args.command == "status":
+        from kaggle.api.kaggle_api_extended import KaggleApi
+
+        api = KaggleApi()
+        api.authenticate()
+        state = api.kernels_status(f"{args.username}/{args.notebook_slug}")
+        print("status:", getattr(state, "status", state))
+        print("harvest only works once the status is COMPLETE.")
     else:
         notebook(
             args.notebook_slug, args.username,

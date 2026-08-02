@@ -283,9 +283,19 @@ def session(
         # Always persist. A session that trained for eight hours and saved nothing is
         # worse than one that never ran.
         persist(work, store_path, run_name)
+
+        if environment == "kaggle":
+            # Everything under /kaggle/working becomes the version's output, so drop the
+            # working copy and the unpacked archive -- both duplicate the store and would
+            # triple the download when harvesting.
+            for junk in (work.parent, Path("/kaggle/working/_unpacked")):
+                if junk.exists() and store_path not in junk.parents and junk != store_path:
+                    shutil.rmtree(junk, ignore_errors=True)
+
         print(f"elapsed {(time.time() - started) / 60:.0f} min")
         if environment == "kaggle":
             print(
-                "\nNext: 'Save Version' -> the output becomes a Dataset. Attach that "
-                "dataset to your next session and it resumes automatically."
+                "\nThis run's output is saved automatically when the session COMPLETES.\n"
+                "Do not click 'Save Version' -- that starts a separate run from the old\n"
+                "dataset. Harvest instead:  python kaggle_setup.py harvest"
             )
